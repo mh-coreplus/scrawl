@@ -147,6 +147,33 @@ textarea.input{resize:vertical;min-height:80px;font-size:.92rem;line-height:1.5}
 .foot{margin-top:24px;color:var(--muted);font-size:.8rem;line-height:1.6}
 
 /* ============================================================
+   CONNECTION STATUS
+   ============================================================ */
+.conn{display:flex;align-items:center;gap:9px;font-size:.85rem;color:var(--muted);
+  background:rgba(0,0,0,.24);border-radius:var(--r-md);padding:9px 12px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--muted);flex:none}
+.dot.busy{background:var(--amber);animation:blink 1.1s ease-in-out infinite}
+.dot.bad{background:var(--pink)}
+.dot.live{background:var(--mint)}
+@keyframes blink{50%{opacity:.25}}
+
+.diag{margin-top:4px;background:rgba(0,0,0,.24);border:1.5px solid var(--line);
+  border-radius:var(--r-md);padding:13px 14px;font-size:.84rem}
+.diag > strong{display:block;margin-bottom:9px;font-size:.92rem}
+.diag ul{list-style:none;margin:0 0 10px;padding:0;display:grid;gap:6px}
+.diag li{color:var(--muted);line-height:1.5}
+.diag li b{color:var(--text);font-weight:600;margin-right:.4em}
+.diag .yes{color:var(--mint);font-weight:600}
+.diag .no{color:var(--pink);font-weight:600}
+.diag .why{border-top:1px solid var(--line);padding-top:9px;margin-top:3px}
+.diag code{background:rgba(0,0,0,.35);border-radius:5px;padding:.1em .4em;font-size:.94em}
+
+#linkPill{position:fixed;top:calc(var(--safe-t) + 10px);left:50%;transform:translateX(-50%);
+  z-index:60;display:flex;align-items:center;gap:8px;font-size:.82rem;
+  background:var(--ink-deep);border:1.5px solid var(--line-str);border-radius:var(--r-pill);
+  padding:.45em 1.05em;box-shadow:0 6px 18px rgba(0,0,0,.45)}
+
+/* ============================================================
    LOBBY
    ============================================================ */
 .lobby{max-width:900px;margin:0 auto;padding-top:3vh}
@@ -408,6 +435,14 @@ textarea.input{resize:vertical;min-height:80px;font-size:.92rem;line-height:1.5}
       </div>
     </div>
 
+    <div class="conn" id="connStatus" hidden><span class="dot busy"></span><span id="connText"></span></div>
+
+    <div class="diag" id="diagBox" hidden>
+      <strong>Connection check</strong>
+      <ul id="diagList"></ul>
+      <button class="btn btn-sm btn-ghost" id="diagCopy">Copy details</button>
+    </div>
+
     <p class="foot">Everything runs peer-to-peer in your browsers. No accounts, no server, nothing saved.</p>
   </div>
 </section>
@@ -573,6 +608,7 @@ textarea.input{resize:vertical;min-height:80px;font-size:.92rem;line-height:1.5}
   </div>
 </section>
 
+<div id="linkPill" hidden><span class="dot busy"></span><span id="linkText"></span></div>
 <div id="toast"></div>
 
 <script>
@@ -910,25 +946,89 @@ const Paint = (() => {
    a guest only needs the code to find it. Everything else is send/receive.
    ====================================================================== */
 const Net = (() => {
-  let peer = null, conns = new Map(), hostConn = null, isHost = false, code = null, dead = false;
-  let h = {};
-  /** Handlers stop firing once we've left, so messages in flight can't crash us. */
+  let peer = null, conns = new Map(), hostConn = null, isHost = false, code = null;
+  let dead = false, h = {}, retries = 0, timers = [];
+
+  /** Live picture of the connection, so failures can be explained instead of guessed at. */
+  const diag = { stage: 'idle', id: null, brokerOk: false, ice: '—', pc: '—', error: null, code: null };
+
   const fire = (name, ...a) => { if (!dead && h[name]) h[name](...a); };
+  const status = st => { if (st) diag.stage = st; fire('onStatus', diag); };
+  const after = (ms, fn) => { const t = setTimeout(fn, ms); timers.push(t); return t; };
+  const clearTimers = () => { timers.forEach(clearTimeout); timers = []; };
   const newPeer = id => new Peer(id || undefined, CFG.peer);   // undefined id => broker assigns one
 
-  function hostRoom(handlers, attempt = 0) {
-    h = handlers; isHost = true; dead = false;
-    code = makeCode();
-    peer = newPeer(CFG.idPrefix + code);
-    peer.on('open', () => fire('onReady', code, peer.id));
-    peer.on('error', err => {
-      if (err.type === 'unavailable-id' && attempt < 5) { peer.destroy(); return hostRoom(handlers, attempt + 1); }
-      fire('onError', err);
+  const ERRORS = {
+    'browser-incompatible': 'This browser cannot do WebRTC, so it cannot play.',
+    'invalid-id': 'That room code has characters the server will not accept.',
+    'network': 'Cannot reach the matchmaking server. A VPN, blocker or network filter is the usual cause.',
+    'peer-unavailable': 'No game with that code. It may have already finished.',
+    'ssl-unavailable': 'The matchmaking server refused a secure connection.',
+    'server-error': 'The matchmaking server is having problems. Try again shortly.',
+    'socket-error': 'The matchmaking server dropped the connection.',
+    'socket-closed': 'The matchmaking server closed the connection.',
+    'unavailable-id': 'That room code is already taken.',
+    'webrtc': 'WebRTC could not set up the connection.'
+  };
+  const describe = e => (e && ERRORS[e.type]) || (e && e.message) || 'Something went wrong.';
+
+  /** Report the real ICE/peer-connection states — this is what separates a blocked
+      browser from a broken matchmaking server. */
+  function watchLink(conn) {
+    let tries = 0;
+    (function look() {
+      if (dead) return;
+      const pc = conn.peerConnection;
+      if (!pc) { if (tries++ < 60) setTimeout(look, 150); return; }   // outlives the join deadlines
+      const read = () => { diag.ice = pc.iceConnectionState; diag.pc = pc.connectionState; status(); };
+      pc.addEventListener('iceconnectionstatechange', read);
+      pc.addEventListener('connectionstatechange', read);
+      read();
+    })();
+  }
+
+  /** The broker socket can drop while the game carries on. Get it back. */
+  function watchBroker() {
+    peer.on('disconnected', () => {
+      if (dead) return;
+      diag.brokerOk = false;
+      if (retries < 6) {
+        retries++;
+        status('reconnecting');
+        after(600 * retries, () => { try { if (peer && !peer.destroyed) peer.reconnect(); } catch {} });
+      } else {
+        diag.error = 'Could not get back to the matchmaking server.';
+        status('failed');
+      }
     });
+    peer.on('close', () => { if (!dead) { diag.error = 'The connection was closed.'; status('failed'); } });
+  }
+
+  function hostRoom(handlers, attempt = 0) {
+    h = handlers; isHost = true; dead = false; retries = 0;
+    code = makeCode();
+    Object.assign(diag, { stage: 'broker', id: null, brokerOk: false, ice: '—', pc: '—', error: null, code });
+    status();
+    peer = newPeer(CFG.idPrefix + code);
+    let opened = false;
+
+    peer.on('open', id => {
+      diag.id = id; diag.brokerOk = true; retries = 0;
+      status('connected');
+      if (!opened) { opened = true; fire('onReady', code, id); }
+    });
+    peer.on('error', err => {
+      if (err.type === 'unavailable-id' && !opened && attempt < 5) { peer.destroy(); return hostRoom(handlers, attempt + 1); }
+      diag.error = describe(err);
+      if (opened) return status();                       // mid-game: surface it, keep playing
+      status('failed'); fire('onError', { message: diag.error });
+    });
+    watchBroker();
+
     peer.on('connection', conn => {
       conn.on('open', () => {
         if (dead) return conn.close();
-        if (conns.size + 1 >= CFG.maxPlayers) { conn.send({ type: 'full' }); setTimeout(() => conn.close(), 300); return; }
+        if (conns.size + 1 >= CFG.maxPlayers) { conn.send({ type: 'full' }); after(300, () => conn.close()); return; }
         conns.set(conn.peer, conn);
       });
       conn.on('data', d => fire('onMessage', conn.peer, d));
@@ -939,23 +1039,41 @@ const Net = (() => {
   }
 
   function joinRoom(roomCode, handlers) {
-    h = handlers; isHost = false; code = roomCode; dead = false;
+    h = handlers; isHost = false; code = roomCode; dead = false; retries = 0;
+    Object.assign(diag, { stage: 'broker', id: null, brokerOk: false, ice: '—', pc: '—', error: null, code: roomCode });
+    status();
     peer = newPeer(null);
-    let settled = false;
-    const fail = msg => { if (!settled) { settled = true; fire('onError', { message: msg }); } };
-    const timer = setTimeout(() => fail("The host isn't answering. Check the code and try again."), 15000);
+    let settled = false, dialled = false;
+
+    const fail = msg => {
+      if (settled) return;
+      settled = true; clearTimers();
+      diag.error = msg; status('failed');
+      fire('onError', { message: msg });
+    };
+
+    // Two separate deadlines: reaching the broker, then reaching the host.
+    after(10000, () => { if (!diag.brokerOk) fail('Could not reach the matchmaking server. A VPN, ad-blocker or network filter is the usual cause.'); });
+    after(25000, () => { if (diag.brokerOk) fail('Reached the server but could not open a direct link to the host. That is nearly always a browser privacy setting or a restrictive network.'); });
 
     peer.on('open', myId => {
+      diag.id = myId; diag.brokerOk = true; retries = 0;
+      if (dialled) return status('connected');           // a reconnect, not a fresh start
+      dialled = true;
+      status('dialing');
       hostConn = peer.connect(CFG.idPrefix + roomCode, { reliable: true });
-      hostConn.on('open', () => { settled = true; clearTimeout(timer); fire('onReady', myId); });
+      watchLink(hostConn);
+      hostConn.on('open', () => { settled = true; clearTimers(); status('connected'); fire('onReady', myId); });
       hostConn.on('data', d => fire('onMessage', myId, d));
-      hostConn.on('close', () => { clearTimeout(timer); fire('onClose'); });
+      hostConn.on('close', () => { clearTimers(); if (settled) fire('onClose'); });
+      hostConn.on('error', err => { if (!settled) fail(describe(err)); });
     });
     peer.on('error', err => {
-      clearTimeout(timer);
-      if (err.type === 'peer-unavailable') return fail('No game with that code. It may have already finished.');
-      fail(err.message || 'Connection problem.');
+      if (err.type === 'peer-unavailable') return fail(ERRORS['peer-unavailable']);
+      if (!settled) return fail(describe(err));
+      diag.error = describe(err); status();
     });
+    watchBroker();
   }
 
   return {
@@ -963,13 +1081,32 @@ const Net = (() => {
     get isHost() { return isHost; },
     get code() { return code; },
     get id() { return peer ? peer.id : null; },
+    get diag() { return diag; },
+    /** Plain-text dump for pasting into a bug report. */
+    report() {
+      return [
+        'Scrawl connection report',
+        'when:    ' + new Date().toISOString(),
+        'role:    ' + (isHost ? 'host' : 'guest'),
+        'stage:   ' + diag.stage,
+        'broker:  ' + (diag.brokerOk ? 'reached' : 'NOT reached'),
+        'peer id: ' + (diag.id || 'none issued'),
+        'room:    ' + (diag.code || '—'),
+        'ice:     ' + diag.ice,
+        'pc:      ' + diag.pc,
+        'error:   ' + (diag.error || 'none'),
+        'page:    ' + location.href,
+        'agent:   ' + navigator.userAgent
+      ].join('\n');
+    },
     send(id, msg) { const c = conns.get(id); if (c && c.open) c.send(msg); },
     broadcast(msg, except) { for (const [id, c] of conns) if (id !== except && c.open) c.send(msg); },
     toHost(msg) { if (hostConn && hostConn.open) hostConn.send(msg); },
     close() {
-      dead = true;
+      dead = true; clearTimers();
       try { for (const c of conns.values()) c.close(); hostConn && hostConn.close(); peer && peer.destroy(); } catch {}
       conns = new Map(); hostConn = null; peer = null;
+      diag.stage = 'idle';
     }
   };
 })();
@@ -1258,13 +1395,59 @@ const App = (() => {
      'lobbyCode','lobbyRoster','playerCount','lobbyHint','startBtn','startHint','settingsCard',
      'tbRound','tbSub','tbWord','timer','playerList','msgs','guessInput','chatForm','tools',
      'veil','veilTitle','veilSub','veilBody','boardFrame','podium','endLine','againBtn','customWrap',
-     'customWords','wordCount','endHint','hintsToggle','customToggle']
+     'customWords','wordCount','endHint','hintsToggle','customToggle',
+     'connStatus','connText','diagBox','diagList','linkPill','linkText']
       .forEach(id => el[id] = document.getElementById(id));
   }
 
   /* ---------------------------- screens ---------------------------- */
   function screen(name) {
     $$('.screen').forEach(s => s.classList.toggle('on', s.id === 'screen-' + name));
+  }
+  const currentScreen = () => ($$('.screen').find(s => s.classList.contains('on')) || {}).id;
+
+  /* ------------------------ connection status ---------------------- */
+  const LINK_TEXT = {
+    broker: 'Reaching the matchmaking server',
+    dialing: 'Opening a direct link to the host',
+    reconnecting: 'Lost the matchmaking server — retrying',
+    failed: 'Not connected',
+    connected: 'Connected'
+  };
+  function diagRows(d) {
+    const yn = (v, y, n) => `<span class="${v ? 'yes' : 'no'}">${v ? y : n}</span>`;
+    const why = d.brokerOk
+      ? `The matchmaking server answered, so the room code and your network reached it fine.
+         The direct browser-to-browser link is what failed. That is nearly always a privacy
+         feature blocking WebRTC — Brave Shields, Firefox <code>resistFingerprinting</code>,
+         uBlock Origin's WebRTC protection, or a VPN extension. Turn those off for this site,
+         or open a second tab in the same browser as the host to confirm.`
+      : `Your browser never got an id from the matchmaking server, so nothing about the room
+         code matters yet. Open <code>https://0.peerjs.com/peerjs/id</code> in a tab — if that
+         fails too, the free broker is down or something on your network is blocking it.`;
+    return `
+      <li><b>Matchmaking server</b> ${yn(d.brokerOk, 'reached', 'not reached')}</li>
+      <li><b>Your peer id</b> ${d.id ? esc(d.id) : '<span class="no">none issued</span>'}</li>
+      <li><b>Room dialled</b> ${esc(d.code || '—')}</li>
+      <li><b>Direct link</b> ice <code>${esc(d.ice)}</code> · connection <code>${esc(d.pc)}</code></li>
+      ${d.error ? `<li><b>Reported</b> ${esc(d.error)}</li>` : ''}
+      <li class="why">${why}</li>`;
+  }
+  function renderConn(d) {
+    const onHome = currentScreen() === 'screen-home';
+    const bad = d.stage === 'failed' || d.stage === 'reconnecting';
+    const working = d.stage === 'broker' || d.stage === 'dialing';
+
+    el.connStatus.hidden = !(onHome && (working || d.stage === 'reconnecting'));
+    el.connText.textContent = LINK_TEXT[d.stage] || '';
+    el.connStatus.firstElementChild.className = 'dot ' + (bad ? 'bad' : 'busy');
+
+    el.linkPill.hidden = onHome || d.stage === 'connected' || d.stage === 'idle';
+    el.linkText.textContent = LINK_TEXT[d.stage] || '';
+    el.linkPill.firstElementChild.className = 'dot ' + (bad ? 'bad' : 'busy');
+
+    el.diagBox.hidden = !(onHome && d.stage === 'failed');
+    if (!el.diagBox.hidden) el.diagList.innerHTML = diagRows(d);
   }
   function toast(text, ms = 3200) {
     const d = document.createElement('div');
@@ -1481,7 +1664,7 @@ const App = (() => {
   }
 
   return { me, receive, render, screen, toast, chat, ask, sendDraw, isHost, setSeg, countWords,
-           cache, el, get st() { return st; }, set st(v) { st = v; } };
+           renderConn, cache, el, get st() { return st; }, set st(v) { st = v; } };
 })();
 
 /* ================================ BOOT ==================================
@@ -1598,6 +1781,10 @@ const App = (() => {
   /* ---- end screen ---- */
   $('#againBtn').onclick = () => Host.again();
   $('#leaveBtn').onclick = () => { Net.close(); location.hash = ''; location.reload(); };
+  $('#diagCopy').onclick = async () => {
+    try { await navigator.clipboard.writeText(Net.report()); App.toast('Details copied'); }
+    catch { prompt('Copy this:', Net.report()); }
+  };
 
   /* ---- connecting ---- */
   function requireName() {
@@ -1624,8 +1811,9 @@ const App = (() => {
       },
       onError(err) {
         busy($('#createBtn'), false, 'Start a game');
-        App.toast(err.message || "Couldn't open a room. Try again.");
+        App.toast(err.message || "Couldn't open a room. Try again.", 7000);
       },
+      onStatus: d => App.renderConn(d),
       onMessage: (from, m) => Host.handle(from, m),
       onLeave: id => Host.leave(id)
     });
@@ -1643,7 +1831,8 @@ const App = (() => {
         location.hash = code;
         Net.toHost({ type: 'hello', name: me.name, avatar: me.avatar });
       },
-      onError(err) { busy($('#joinBtn'), false, 'Join'); App.toast(err.message || 'Could not join.'); },
+      onError(err) { busy($('#joinBtn'), false, 'Join'); App.toast(err.message || 'Could not join.', 7000); },
+      onStatus: d => App.renderConn(d),
       onMessage: (_from, m) => App.receive(m),
       onClose() { App.toast('The host closed the game.'); setTimeout(() => { location.hash = ''; location.reload(); }, 1600); }
     });
