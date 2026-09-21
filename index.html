@@ -629,7 +629,17 @@ textarea.input{resize:vertical;min-height:80px;font-size:.92rem;line-height:1.5}
 
 /* ============================== CONFIG ================================== */
 const CFG = {
-  peer: {},                 // put your own PeerServer config here if you host one
+  /* PeerJS's built-in defaults list two TURN hosts — eu-0/us-0.turn.peerjs.com —
+     that no longer resolve in DNS, which leaves a connection with no relay at all.
+     These are real. Swap in your own TURN here if you'd rather not share one. */
+  ice: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:openrelay.metered.ca:80' },
+    { urls: 'turn:openrelay.metered.ca:80',  username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+  ],
+  peer: {},                 // built below; add host/port here for your own PeerServer
   idPrefix: 'scrawl-v1-',   // namespaces our room codes on the public broker
   codeAlphabet: 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789',
   codeLength: 5,
@@ -642,6 +652,11 @@ const CFG = {
   points: { base: 80, speed: 320, firstBonus: 40, secondBonus: 25, thirdBonus: 15,
             drawBase: 60, drawSpread: 240 }
 };
+
+/* Adding ?relay to the URL forces every packet through TURN. Useless for playing —
+   it is a test switch that proves in one go whether a relay fixes a dead connection. */
+const RELAY_ONLY = /[?&]relay\b/.test(location.search);
+CFG.peer = { config: { iceServers: CFG.ice, ...(RELAY_ONLY ? { iceTransportPolicy: 'relay' } : {}) } };
 
 /* =============================== UTIL =================================== */
 const $  = (s, r = document) => r.querySelector(s);
@@ -950,7 +965,10 @@ const Net = (() => {
   let dead = false, h = {}, retries = 0, timers = [];
 
   /** Live picture of the connection, so failures can be explained instead of guessed at. */
-  const diag = { stage: 'idle', id: null, brokerOk: false, ice: '—', pc: '—', error: null, code: null };
+  const blankCandidates = () => ({ host: 0, srflx: 0, prflx: 0, relay: 0 });
+  const diag = { stage: 'idle', id: null, brokerOk: false, ice: '—', pc: '—',
+                 cand: blankCandidates(), pair: 'none', relayOnly: RELAY_ONLY, error: null, code: null };
+  let livePc = null;
 
   const fire = (name, ...a) => { if (!dead && h[name]) h[name](...a); };
   const status = st => { if (st) diag.stage = st; fire('onStatus', diag); };
@@ -979,12 +997,38 @@ const Net = (() => {
     (function look() {
       if (dead) return;
       const pc = conn.peerConnection;
-      if (!pc) { if (tries++ < 60) setTimeout(look, 150); return; }   // outlives the join deadlines
+      if (!pc) { if (tries++ < 200) setTimeout(look, 50); return; }   // outlives the join deadlines
+      livePc = pc;
       const read = () => { diag.ice = pc.iceConnectionState; diag.pc = pc.connectionState; status(); };
+      pc.addEventListener('icecandidate', e => {
+        const t = e.candidate && e.candidate.type;
+        if (t) { diag.cand[t] = (diag.cand[t] || 0) + 1; status(); }
+      });
       pc.addEventListener('iceconnectionstatechange', read);
       pc.addEventListener('connectionstatechange', read);
       read();
     })();
+  }
+
+  /** Which candidate types were actually gathered, and did any pair connect?
+      This is the difference between "STUN is blocked" and "TURN is unreachable". */
+  async function readStats() {
+    if (!livePc || !livePc.getStats) return;
+    try {
+      const stats = await livePc.getStats();
+      const c = blankCandidates();
+      let pair = 'none';
+      stats.forEach(r => {
+        if (r.type === 'local-candidate' && r.candidateType) c[r.candidateType] = (c[r.candidateType] || 0) + 1;
+        if (r.type === 'candidate-pair') {
+          if (r.state === 'succeeded') pair = 'succeeded';
+          else if (pair === 'none') pair = r.state || 'none';
+        }
+      });
+      for (const k in c) if (c[k] > diag.cand[k]) diag.cand[k] = c[k];
+      diag.pair = pair;
+      status();
+    } catch {}
   }
 
   /** The broker socket can drop while the game carries on. Get it back. */
@@ -1007,7 +1051,9 @@ const Net = (() => {
   function hostRoom(handlers, attempt = 0) {
     h = handlers; isHost = true; dead = false; retries = 0;
     code = makeCode();
-    Object.assign(diag, { stage: 'broker', id: null, brokerOk: false, ice: '—', pc: '—', error: null, code });
+    Object.assign(diag, { stage: 'broker', id: null, brokerOk: false, ice: '—', pc: '—',
+                          cand: blankCandidates(), pair: 'none', error: null, code });
+    livePc = null;
     status();
     peer = newPeer(CFG.idPrefix + code);
     let opened = false;
@@ -1040,7 +1086,9 @@ const Net = (() => {
 
   function joinRoom(roomCode, handlers) {
     h = handlers; isHost = false; code = roomCode; dead = false; retries = 0;
-    Object.assign(diag, { stage: 'broker', id: null, brokerOk: false, ice: '—', pc: '—', error: null, code: roomCode });
+    Object.assign(diag, { stage: 'broker', id: null, brokerOk: false, ice: '—', pc: '—',
+                          cand: blankCandidates(), pair: 'none', error: null, code: roomCode });
+    livePc = null;
     status();
     peer = newPeer(null);
     let settled = false, dialled = false;
@@ -1049,6 +1097,7 @@ const Net = (() => {
       if (settled) return;
       settled = true; clearTimers();
       diag.error = msg; status('failed');
+      readStats();                                  // fills in the candidate picture
       fire('onError', { message: msg });
     };
 
@@ -1063,7 +1112,7 @@ const Net = (() => {
       status('dialing');
       hostConn = peer.connect(CFG.idPrefix + roomCode, { reliable: true });
       watchLink(hostConn);
-      hostConn.on('open', () => { settled = true; clearTimers(); status('connected'); fire('onReady', myId); });
+      hostConn.on('open', () => { settled = true; clearTimers(); status('connected'); readStats(); fire('onReady', myId); });
       hostConn.on('data', d => fire('onMessage', myId, d));
       hostConn.on('close', () => { clearTimers(); if (settled) fire('onClose'); });
       hostConn.on('error', err => { if (!settled) fail(describe(err)); });
@@ -1094,6 +1143,9 @@ const Net = (() => {
         'room:    ' + (diag.code || '—'),
         'ice:     ' + diag.ice,
         'pc:      ' + diag.pc,
+        'cands:   host ' + diag.cand.host + ' · srflx ' + diag.cand.srflx + ' · relay ' + diag.cand.relay,
+        'pair:    ' + diag.pair,
+        'relay:   ' + (diag.relayOnly ? 'forced (?relay)' : 'normal'),
         'error:   ' + (diag.error || 'none'),
         'page:    ' + location.href,
         'agent:   ' + navigator.userAgent
@@ -1416,19 +1468,37 @@ const App = (() => {
   };
   function diagRows(d) {
     const yn = (v, y, n) => `<span class="${v ? 'yes' : 'no'}">${v ? y : n}</span>`;
-    const why = d.brokerOk
-      ? `The matchmaking server answered, so the room code and your network reached it fine.
-         The direct browser-to-browser link is what failed. That is nearly always a privacy
-         feature blocking WebRTC — Brave Shields, Firefox <code>resistFingerprinting</code>,
-         uBlock Origin's WebRTC protection, or a VPN extension. Turn those off for this site,
-         or open a second tab in the same browser as the host to confirm.`
-      : `Your browser never got an id from the matchmaking server, so nothing about the room
-         code matters yet. Open <code>https://0.peerjs.com/peerjs/id</code> in a tab — if that
-         fails too, the free broker is down or something on your network is blocking it.`;
+    const c = d.cand || { host: 0, srflx: 0, relay: 0 };
+    let why;
+    if (!d.brokerOk) {
+      why = `Your browser never got an id from the matchmaking server, so nothing about the
+             room code matters yet. Open <code>https://0.peerjs.com/peerjs/id</code> in a tab —
+             if that fails too, the broker is down or something on your network is blocking it.`;
+    } else if (!c.srflx && !c.relay) {
+      why = `Neither STUN nor TURN produced a single candidate, so your browser could not work
+             out how to be reached from outside. Outbound UDP is being blocked — usually a VPN,
+             a corporate or campus network, or a firewall. Try <code>?relay</code> on the end of
+             the URL to force everything through a relay on port 443.`;
+    } else if (!c.relay) {
+      why = `STUN worked but no relay candidates appeared, so there is no fallback when a direct
+             path is unavailable. The TURN server is unreachable from here — likely blocked, or
+             temporarily down.`;
+    } else if (d.pair !== 'succeeded') {
+      why = `Candidates were gathered on both paths but no pair ever connected, so something is
+             dropping the traffic between the two browsers rather than blocking discovery.
+             Add <code>?relay</code> to the URL to force the relay path and see if that gets through.`;
+    } else {
+      why = `A candidate pair did connect, so the link came up and then dropped. That points at an
+             unstable network rather than a blocked one.`;
+    }
     return `
       <li><b>Matchmaking server</b> ${yn(d.brokerOk, 'reached', 'not reached')}</li>
       <li><b>Your peer id</b> ${d.id ? esc(d.id) : '<span class="no">none issued</span>'}</li>
       <li><b>Room dialled</b> ${esc(d.code || '—')}</li>
+      <li><b>Candidates found</b> local ${c.host} · via STUN ${
+        c.srflx ? `<span class="yes">${c.srflx}</span>` : '<span class="no">0</span>'} · via relay ${
+        c.relay ? `<span class="yes">${c.relay}</span>` : '<span class="no">0</span>'}</li>
+      <li><b>Best pair</b> <code>${esc(d.pair || 'none')}</code>${d.relayOnly ? ' · relay-only mode on' : ''}</li>
       <li><b>Direct link</b> ice <code>${esc(d.ice)}</code> · connection <code>${esc(d.pc)}</code></li>
       ${d.error ? `<li><b>Reported</b> ${esc(d.error)}</li>` : ''}
       <li class="why">${why}</li>`;
@@ -1682,6 +1752,8 @@ const App = (() => {
   paintAvatar();
   el.nameInput.addEventListener('input', () => { me.name = el.nameInput.value.trim().slice(0, 14); store.set('name', me.name); });
   $('#rerollAvatar').addEventListener('click', () => { me.avatar = Avatar.random(); store.set('avatar', me.avatar); paintAvatar(); Sfx.someone(); });
+
+  if (RELAY_ONLY) App.toast('Relay-only test mode is on — remove ?relay from the URL to play normally', 9000);
 
   /* ---- audio needs a gesture before it will make a sound ---- */
   addEventListener('pointerdown', () => Sfx.unlock(), { once: true });
